@@ -1,18 +1,23 @@
-#requires -Version 5.1
+﻿#requires -Version 5.1
 
 <#
 .SYNOPSIS
-    Reversible, inventory-driven debloat for a Dell G15 5530 running Windows 11.
+    Aggressive, reversible telemetry and background-service debloat for a Dell G15 5530 running Windows 11.
 
 .DESCRIPTION
     This script targets active optional components found in the audit:
       * Reports the OEM-protected Intel Graphics Software service but leaves it unchanged
-      * NVIDIA App background container/PresentMon (not the display driver or Control Panel container)
-      * Windows cross-device resume, consumer-content promotion, Recall, and Click to Do
-      * Two nonessential Office background tasks; protected Windows tasks are reported but not modified
+      * Windows/OEM telemetry, diagnostic uploads, and optional background services
+      * Supported diagnostic-data, cross-device, activity-history and consumer-content settings
+      * Exact telemetry/feedback task targets and three optional Office tasks; protected tasks are reported
 
-    It does not remove Appx packages, drivers, services, scheduled tasks, or user data.
-    Apply creates a complete state backup before changing anything. Restore replays that state.
+    It does not uninstall Appx packages, drivers, services, or scheduled tasks.
+    It does not delete files or development tools.
+    Apply journals only attempted changes and backs up their prior state.
+    Each failed target is restored independently; successful debloating is retained.
+    Failures are reported with a nonzero exit status. RestoreLatest explicitly undoes
+    the latest run. Existing AllowTelemetry=0 is never raised during Apply.
+    Recall policies remain read-only because changing them can delete snapshots.
 
 .EXAMPLE
     .\G15-Precision-Debloat.ps1 -Preview
@@ -43,19 +48,13 @@ param(
 
     [Parameter(Mandatory, ParameterSetName = 'RestoreFrom')]
     [ValidateNotNullOrEmpty()]
-    [string]$RestoreFrom,
-
-    # Keeps the NVIDIA App service running. The NVIDIA display driver and
-    # NVDisplay.ContainerLocalSystem are always preserved regardless.
-    [Parameter(ParameterSetName = 'Preview')]
-    [Parameter(ParameterSetName = 'Apply')]
-    [switch]$KeepNvidiaApp
+    [string]$RestoreFrom
 )
 
 Set-StrictMode -Version 2.0
 $ErrorActionPreference = 'Stop'
 
-$ScriptVersion = '1.0.2'
+$ScriptVersion = '1.3.1'
 $StateRoot = Join-Path $env:ProgramData 'G15-Precision-Debloat'
 
 $ProtectedServiceNotes = @(
@@ -65,16 +64,35 @@ $ProtectedServiceNotes = @(
     }
 )
 
-$ServiceTargets = @()
+# Explicit targets only. Missing services are skipped; no wildcard service disabling.
+$AllServiceTargets = @(
+    [pscustomobject]@{ Name='DiagTrack'; StartupType='Disabled'; Reason='Connected User Experiences and Telemetry collection/upload.' },
+    [pscustomobject]@{ Name='diagnosticshub.standardcollector.service'; StartupType='Disabled'; Reason='Optional diagnostics hub collector; profiling sessions may need it.' },
+    [pscustomobject]@{ Name='dptftcs'; StartupType='Disabled'; Reason='Intel Dynamic Tuning telemetry only; ipfsvc and thermal control preserved.' },
+    [pscustomobject]@{ Name='InventorySvc'; StartupType='Disabled'; Reason='Inventory and compatibility appraisal collection; compatibility assessment reduced.' },
+    [pscustomobject]@{ Name='wuqisvc'; StartupType='Disabled'; Reason='Microsoft Usage and Quality Insights collection.' },
+    [pscustomobject]@{ Name='WerSvc'; StartupType='Disabled'; Reason='Windows crash/problem report collection and upload; automated error solutions unavailable.' },
+    [pscustomobject]@{ Name='wercplsupport'; StartupType='Disabled'; Reason='Problem Reports Control Panel support.' },
+    [pscustomobject]@{ Name='CDPSvc'; StartupType='Disabled'; Reason='Cross-device/nearby shared experiences; standalone Bluetooth and USB retained.' },
+    [pscustomobject]@{ Name='MapsBroker'; StartupType='Disabled'; Reason='Downloaded offline maps management; automatic offline map updates disabled.' },
+    [pscustomobject]@{ Name='RetailDemo'; StartupType='Disabled'; Reason='Retail demonstration mode.' },
+    [pscustomobject]@{ Name='WMPNetworkSvc'; StartupType='Disabled'; Reason='Windows Media Player network media sharing.' },
+    [pscustomobject]@{ Name='PushToInstall'; StartupType='Disabled'; Reason='Remote app push installation from other devices.' },
+    [pscustomobject]@{ Name='PhoneSvc'; StartupType='Disabled'; Reason='Phone integration; Phone Link features may be unavailable.' },
+    [pscustomobject]@{ Name='TrkWks'; StartupType='Disabled'; Reason='Tracking links to files across computers on a network.' },
+    [pscustomobject]@{ Name='wisvc'; StartupType='Disabled'; Reason='Windows Insider management; stable Windows Update retained.' },
+    [pscustomobject]@{ Name='DellConnectedServiceDelivery'; StartupType='Disabled'; Reason='Optional Dell connected-service delivery; support integrations unavailable.' },
+    [pscustomobject]@{ Name='DellTechHub'; StartupType='Disabled'; Reason='Optional Dell support/diagnostic backend; Dell support integrations unavailable.' },
+    [pscustomobject]@{ Name='SupportAssistAgent'; StartupType='Disabled'; Reason='Optional Dell SupportAssist monitoring and remote support backend.' },
+    [pscustomobject]@{ Name='DDVDataCollector'; StartupType='Disabled'; Reason='Dell Data Vault collection.' },
+    [pscustomobject]@{ Name='DDVRulesProcessor'; StartupType='Disabled'; Reason='Dell Data Vault processing.' },
+    [pscustomobject]@{ Name='DDVCollectorSvcApi'; StartupType='Disabled'; Reason='Dell Data Vault collector API.' }
+)
+$ServiceTargets = @($AllServiceTargets)
 
-if (-not $KeepNvidiaApp) {
-    $ServiceTargets += [pscustomobject]@{
-        Name        = 'NvContainerLocalSystem'
-        StartupType = 'Manual'
-        Stop        = $true
-        Reason      = 'NVIDIA App backend/overlay. The display driver and NVDisplay.ContainerLocalSystem are preserved.'
-    }
-}
+# These names are accepted only when restoring backups made by older versions.
+# They are never included in a new Preview or Apply plan.
+$LegacyRestoreServiceNames = @('NvContainerLocalSystem', 'NvTelemetryContainer')
 
 $TaskTargets = @(
     [pscustomobject]@{
@@ -86,79 +104,116 @@ $TaskTargets = @(
         Path   = '\Microsoft\Office\'
         Name   = 'Office Background Push Maintenance'
         Reason = 'Optional Office background push maintenance; Office automatic updates are preserved.'
+    },
+    [pscustomobject]@{
+        Path   = '\Microsoft\Office\'
+        Name   = 'Office Performance Monitor'
+        Reason = 'Optional Office performance-monitoring task; updates and Click-to-Run are preserved.'
     }
+)
+
+# Exact path/name pairs. Update, security, certificate, driver and MDM tasks are excluded.
+$TaskTargets += @(
+    [pscustomobject]@{ Path='\Microsoft\Windows\Application Experience\'; Name='Microsoft Compatibility Appraiser'; Reason='Compatibility inventory/appraisal collection.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Application Experience\'; Name='Microsoft Compatibility Appraiser Exp'; Reason='Compatibility inventory/appraisal collection.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Application Experience\'; Name='ProgramDataUpdater'; Reason='Application inventory collection.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Application Experience\'; Name='MareBackup'; Reason='Application experience inventory task; compatibility assessment reduced.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Application Experience\'; Name='StartupAppTask'; Reason='Startup application inventory.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Customer Experience Improvement Program\'; Name='Consolidator'; Reason='Customer Experience Improvement Program reporting.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Customer Experience Improvement Program\'; Name='UsbCeip'; Reason='USB Customer Experience Improvement Program reporting.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Customer Experience Improvement Program\'; Name='KernelCeipTask'; Reason='Legacy kernel Customer Experience Improvement Program reporting.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Feedback\Siuf\'; Name='DmClient'; Reason='Feedback solicitation.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Feedback\Siuf\'; Name='DmClientOnScenarioDownload'; Reason='Feedback scenario downloads.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Windows Error Reporting\'; Name='QueueReporting'; Reason='Queued crash and error report uploads.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\DiskDiagnostic\'; Name='Microsoft-Windows-DiskDiagnosticDataCollector'; Reason='Disk diagnostic data collection; disk repair tasks retained.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\DiskFootprint\'; Name='Diagnostics'; Reason='Storage diagnostic collection; Storage Sense retained.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Diagnosis\'; Name='Scheduled'; Reason='Scheduled diagnostic analysis; automatic troubleshooting reduced.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Diagnosis\'; Name='UnexpectedCodepath'; Reason='Unexpected-code-path diagnostics; automatic troubleshooting reduced.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Diagnosis\'; Name='RecommendedTroubleshootingScanner'; Reason='Recommended troubleshooting scanner.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\DUSM\'; Name='dusmtask'; Reason='Data usage statistics maintenance.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\PI\'; Name='Sqm-Tasks'; Reason='Software quality metrics.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Sustainability\'; Name='SustainabilityTelemetry'; Reason='Sustainability telemetry; power-plan settings retained.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Flighting\FeatureConfig\'; Name='UsageDataFlushing'; Reason='Feature usage data flushing.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Flighting\FeatureConfig\'; Name='UsageDataReceiver'; Reason='Feature usage data reception.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Flighting\FeatureConfig\'; Name='UsageDataReporting'; Reason='Feature usage reporting.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Flighting\FeatureConfig\'; Name='BootstrapUsageDataReporting'; Reason='Feature bootstrap usage reporting.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\PerformanceTrace\'; Name='ShowFeedbackToast'; Reason='Performance feedback prompts.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Maps\'; Name='MapsToastTask'; Reason='Offline maps notifications.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Maps\'; Name='MapsUpdateTask'; Reason='Offline maps updates.' },
+    [pscustomobject]@{ Path='\Microsoft\Windows\Windows Media Sharing\'; Name='UpdateLibrary'; Reason='Media sharing library updates.' }
 )
 
 $ProtectedTaskNotes = @(
     [pscustomobject]@{
         Path   = '\Microsoft\Windows\UsageAndQualityInsights\'
         Name   = 'UsageAndQualityInsights-MaintenanceTask'
-        Reason = 'Windows-protected on this machine; left unchanged. Its associated service is already disabled.'
+        Reason = 'Windows-protected on this machine; left unchanged. The associated wuqisvc service is targeted separately.'
     },
     [pscustomobject]@{
         Path   = '\Microsoft\Windows\WindowsAI\ClickToDo\'
         Name   = 'ModelCachingLimit'
-        Reason = 'Windows-protected on this machine; left unchanged. Click to Do is already disabled by policy.'
+        Reason = 'Windows-protected on this machine; left unchanged. Current Click to Do policy is reported below.'
     },
     [pscustomobject]@{
         Path   = '\Microsoft\Windows\WindowsAI\ClickToDo\'
         Name   = 'ModelCachingUpdate'
-        Reason = 'Windows-protected on this machine; left unchanged. Click to Do is already disabled by policy.'
+        Reason = 'Windows-protected on this machine; left unchanged. Current Click to Do policy is reported below.'
     }
 )
 
-# These are documented Windows policy values, not undocumented tuning knobs.
+# Diagnostic data: https://learn.microsoft.com/windows/privacy/configure-windows-diagnostic-data-in-your-organization
+# Recall effects: https://learn.microsoft.com/windows/client-management/mdm/policy-csp-windowsai
+# All = local setting supported on Home too; policy targets retain edition filtering.
 $RegistryTargets = @(
-    [pscustomobject]@{
-        Path   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'
-        Name   = 'EnableCdp'
-        Type   = 'DWord'
-        Value  = 0
-        Reason = 'Disable cross-device/Continue experiences; prevents the observed CrossDeviceResume workload after reboot.'
-    },
-    [pscustomobject]@{
-        Path   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'
-        Name   = 'DisableWindowsConsumerFeatures'
-        Type   = 'DWord'
-        Value  = 1
-        Reason = 'Disable Microsoft consumer-feature promotion and suggested app provisioning.'
-    },
-    [pscustomobject]@{
-        Path   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'
-        Name   = 'DisableConsumerAccountStateContent'
-        Type   = 'DWord'
-        Value  = 1
-        Reason = 'Disable cloud consumer-account promotional content in Windows experiences.'
-    },
-    [pscustomobject]@{
-        Path   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo'
-        Name   = 'DisabledByGroupPolicy'
-        Type   = 'DWord'
-        Value  = 1
-        Reason = 'Disable the Windows advertising identifier.'
-    },
-    [pscustomobject]@{
-        Path   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'
-        Name   = 'DisableClickToDo'
-        Type   = 'DWord'
-        Value  = 1
-        Reason = 'Disable Click to Do and its entry points.'
-    },
-    [pscustomobject]@{
-        Path   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'
-        Name   = 'AllowRecallEnablement'
-        Type   = 'DWord'
-        Value  = 0
-        Reason = 'Keep Windows Recall unavailable.'
-    },
-    [pscustomobject]@{
-        Path   = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'
-        Name   = 'DisableAIDataAnalysis'
-        Type   = 'DWord'
-        Value  = 1
-        Reason = 'Turn off saving snapshots for Recall.'
-    }
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='EnableCdp'; Type='DWord'; Value=0; Editions='Business'; MinBuild=0; Reason='Disable cross-device shared experiences.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='EnableActivityFeed'; Type='DWord'; Value=0; Editions='Business'; MinBuild=0; Reason='Disable activity feed.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='PublishUserActivities'; Type='DWord'; Value=0; Editions='Business'; MinBuild=0; Reason='Disable publishing user activities.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\System'; Name='UploadUserActivities'; Type='DWord'; Value=0; Editions='Business'; MinBuild=0; Reason='Disable uploading user activities.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableWindowsConsumerFeatures'; Type='DWord'; Value=1; Editions='Enterprise'; MinBuild=0; Reason='Disable consumer promotions and suggested app provisioning.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\CloudContent'; Name='DisableConsumerAccountStateContent'; Type='DWord'; Value=1; Editions='Enterprise'; MinBuild=0; Reason='Disable consumer account promotional content.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AdvertisingInfo'; Name='DisabledByGroupPolicy'; Type='DWord'; Value=1; Editions='Business'; MinBuild=0; Reason='Disable Windows advertising identifier.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='AllowTelemetry'; Type='DWord'; Value=1; Editions='Business'; MinBuild=0; Reason='Lowest supported diagnostic-data policy: 0 on Enterprise/Education, 1 on Pro.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='DoNotShowFeedbackNotifications'; Type='DWord'; Value=1; Editions='Business'; MinBuild=0; Reason='Suppress feedback requests.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='LimitDiagnosticLogCollection'; Type='DWord'; Value=1; Editions='Business'; MinBuild=22000; Reason='Block additional optional diagnostic log collection.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\DataCollection'; Name='LimitDumpCollection'; Type='DWord'; Value=1; Editions='Business'; MinBuild=22000; Reason='Limit optional diagnostic dump collection.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Policies\Microsoft\Windows\AppCompat'; Name='AITEnable'; Type='DWord'; Value=0; Editions='Business'; MinBuild=0; Reason='Turn off application impact telemetry.' },
+    [pscustomobject]@{ Path='HKLM:\SOFTWARE\Microsoft\Windows\Windows Error Reporting'; Name='Disabled'; Type='DWord'; Value=1; Editions='All'; MinBuild=0; Reason='Disable Windows Error Reporting.' },
+    [pscustomobject]@{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\Privacy'; Name='TailoredExperiencesWithDiagnosticDataEnabled'; Type='DWord'; Value=0; Editions='All'; MinBuild=0; Reason='Turn off diagnostic-data-based tailored experiences for this user.' },
+    [pscustomobject]@{ Path='HKCU:\Software\Microsoft\Windows\CurrentVersion\AdvertisingInfo'; Name='Enabled'; Type='DWord'; Value=0; Editions='All'; MinBuild=0; Reason='Turn off advertising identifier for this user.' },
+    [pscustomobject]@{ Path='HKCU:\Software\Microsoft\InputPersonalization'; Name='RestrictImplicitTextCollection'; Type='DWord'; Value=1; Editions='All'; MinBuild=0; Reason='Restrict implicit typing data collection for this user.' },
+    [pscustomobject]@{ Path='HKCU:\Software\Microsoft\InputPersonalization'; Name='RestrictImplicitInkCollection'; Type='DWord'; Value=1; Editions='All'; MinBuild=0; Reason='Restrict implicit ink collection for this user.' },
+    [pscustomobject]@{ Path='HKCU:\Software\Microsoft\Siuf\Rules'; Name='NumberOfSIUFInPeriod'; Type='DWord'; Value=0; Editions='All'; MinBuild=0; Reason='Disable feedback solicitation for this user.' },
+    [pscustomobject]@{ Path='HKCU:\Software\Microsoft\Siuf\Rules'; Name='PeriodInNanoSeconds'; Type='DWord'; Value=0; Editions='All'; MinBuild=0; Reason='Set feedback solicitation frequency to never.' }
 )
+
+# Read-only: a reversible registry backup cannot recover deleted Recall snapshots.
+$ReportedAIValues = @('DisableClickToDo', 'AllowRecallEnablement', 'DisableAIDataAnalysis')
+
+function Get-CurrentUserSid {
+    return [Security.Principal.WindowsIdentity]::GetCurrent().User.Value
+}
+
+function Get-ApplicableRegistryTargets {
+    $windows = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion'
+    $business = $windows.EditionID -match '^(Professional|Enterprise|Education|IoTEnterprise)'
+    $enterprise = $windows.EditionID -match '^(Enterprise|Education|IoTEnterprise)'
+    foreach ($target in $RegistryTargets) {
+        if ($target.MinBuild -gt [int]$windows.CurrentBuildNumber) { continue }
+        if ($target.Editions -eq 'Business' -and -not $business) { continue }
+        if ($target.Editions -eq 'Enterprise' -and -not $enterprise) { continue }
+        $copy = $target.PSObject.Copy()
+        if ($copy.Name -eq 'AllowTelemetry') {
+            $copy.Value = if ($enterprise) { 0 } else { 1 }
+            $existing = Get-RegistryValueState -Path $copy.Path -Name $copy.Name
+            # Pro does not support diagnostic-data-off, but must not overwrite a
+            # pre-existing stricter preference. This is not a zero-telemetry claim.
+            if ($existing.ValueExists -and $existing.Kind -eq 'DWord' -and $existing.Value -eq 0) {
+                $copy.Value = 0
+            }
+        }
+        $copy
+    }
+}
 
 function Write-Section {
     param([Parameter(Mandatory)][string]$Title)
@@ -246,62 +301,217 @@ function Clear-TaskCache {
 $script:TaskCache = @()
 $script:TaskCacheLoaded = $false
 
-function New-StateBackup {
-    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss-fff'
-    $directory = Join-Path $StateRoot $stamp
-    New-Item -Path $directory -ItemType Directory -Force | Out-Null
-
-    $services = foreach ($target in $ServiceTargets) {
+function Get-PostUpdatePlan {
+    Clear-TaskCache
+    $script:PlanIssues = @()
+    $computer = Get-CimInstance Win32_ComputerSystem
+    $cpu = Get-CimInstance Win32_Processor | Select-Object -First 1
+    if ($computer.Model -notmatch 'G15\s+5530' -or $cpu.Name -notmatch 'i5-13450HX') {
+        throw "This policy targets G15 5530 / i5-13450HX, detected $($computer.Model), $($cpu.Name)."
+    }
+    $plan = New-Object System.Collections.Generic.List[object]
+    foreach ($target in $ServiceTargets) {
         $service = Get-Service -Name $target.Name -ErrorAction SilentlyContinue
-        if ($null -eq $service) {
-            [pscustomobject]@{ Name = $target.Name; Exists = $false }
+        if ($null -eq $service) { continue }
+        $mode = Get-ServiceStartupType -Name $target.Name
+        if ($mode -eq $target.StartupType -and $service.Status -eq 'Stopped') { continue }
+        $dependents = @($service.DependentServices | Where-Object { $_.Status -ne 'Stopped' })
+        if ($dependents.Count -gt 0) {
+            $message = "Skipped $($target.Name): running dependents: $($dependents.Name -join ', ')."
+            $script:PlanIssues += $message
+            Write-Warning $message
             continue
         }
-
-        $serviceKey = 'HKLM:\SYSTEM\CurrentControlSet\Services\{0}' -f $target.Name
-        $delayedState = Get-RegistryValueState -Path $serviceKey -Name 'DelayedAutoStart'
-        [pscustomobject]@{
-            Name             = $target.Name
-            Exists           = $true
-            StartupType      = Get-ServiceStartupType -Name $target.Name
-            Status           = $service.Status.ToString()
-            DelayedAutoState = $delayedState
+        if ($service.Status -notin @('Running', 'Stopped')) {
+            $message = "Skipped $($target.Name): wait for the service to settle, then retry."
+            $script:PlanIssues += $message
+            Write-Warning $message
+            continue
         }
+        $key = 'HKLM:\SYSTEM\CurrentControlSet\Services\{0}' -f $target.Name
+        $before = [pscustomobject]@{
+            Name=$target.Name; StartupType=$mode; Status=$service.Status.ToString()
+            DelayedAutoState=(Get-RegistryValueState -Path $key -Name 'DelayedAutoStart')
+        }
+        $plan.Add([pscustomobject]@{Kind='Service'; Name=$target.Name; Before=$before; Desired=$target.StartupType})
     }
-
-    $tasks = foreach ($target in $TaskTargets) {
+    foreach ($target in $TaskTargets) {
         $task = Get-TaskOrNull -Path $target.Path -Name $target.Name
-        [pscustomobject]@{
-            Path    = $target.Path
-            Name    = $target.Name
-            Exists  = ($null -ne $task)
-            Enabled = if ($null -ne $task) { [bool]$task.Settings.Enabled } else { $null }
+        if ($null -eq $task -or -not $task.Settings.Enabled) { continue }
+        $before = [pscustomobject]@{Path=$target.Path; Name=$target.Name; Enabled=$true}
+        $plan.Add([pscustomobject]@{Kind='Task'; Name=$target.Name; Before=$before; Desired='Disabled'})
+    }
+    foreach ($target in @(Get-ApplicableRegistryTargets)) {
+        $before = Get-RegistryValueState -Path $target.Path -Name $target.Name
+        if ($before.ValueExists -and $before.Kind -eq 'DWord' -and $before.Value -eq $target.Value) { continue }
+        $plan.Add([pscustomobject]@{Kind='Registry'; Name=$target.Name; Before=$before; Desired=$target.Value})
+    }
+    return $plan.ToArray()
+}
+
+function Save-PostUpdateState {
+    param([Parameter(Mandatory)]$State,[Parameter(Mandatory)][string]$File)
+    $temp = "$File.tmp"
+    $State | Export-Clixml -LiteralPath $temp -Depth 12
+    $check = Import-Clixml -LiteralPath $temp
+    if ($check.SchemaVersion -ne 2 -or $check.Id -ne $State.Id) { throw 'State backup verification failed.' }
+    Move-Item -LiteralPath $temp -Destination $File -Force
+}
+
+function Assert-PostUpdateEntry {
+    param([Parameter(Mandatory)]$Entry)
+    switch ($Entry.Kind) {
+        'Service' {
+            if ($Entry.Name -notin @($AllServiceTargets.Name + $LegacyRestoreServiceNames) -or $Entry.Before.Name -ne $Entry.Name -or
+                $Entry.Before.StartupType -notin @('Automatic','Manual','Disabled') -or
+                $Entry.Before.Status -notin @('Running','Stopped') -or
+                $Entry.Before.DelayedAutoState.Path -ne ('HKLM:\SYSTEM\CurrentControlSet\Services\'+$Entry.Name) -or
+                $Entry.Before.DelayedAutoState.Name -ne 'DelayedAutoStart') { throw 'Invalid service restore entry.' }
+        }
+        'Task' {
+            if ($Entry.Name -notin @($TaskTargets | ForEach-Object Name) -or
+                $Entry.Before.Name -ne $Entry.Name -or
+                @($TaskTargets | Where-Object { $_.Path -eq $Entry.Before.Path -and $_.Name -eq $Entry.Name }).Count -ne 1) { throw 'Invalid task restore entry.' }
+        }
+        'Registry' {
+            if ($Entry.Name -ne $Entry.Before.Name -or @($RegistryTargets | Where-Object { $_.Path -eq $Entry.Before.Path -and $_.Name -eq $Entry.Before.Name }).Count -ne 1) {
+                throw 'Invalid registry restore entry.'
+            }
+        }
+        default { throw 'Unknown restore entry.' }
+    }
+}
+
+function Assert-EntryUnchanged {
+    param([Parameter(Mandatory)]$Entry)
+    Assert-PostUpdateEntry -Entry $Entry
+    switch ($Entry.Kind) {
+        'Service' {
+            $service = Get-Service -Name $Entry.Name -ErrorAction Stop
+            if ((Get-ServiceStartupType $Entry.Name) -ne $Entry.Before.StartupType -or
+                $service.Status.ToString() -ne $Entry.Before.Status) {
+                throw "Service $($Entry.Name) changed since planning; retry."
+            }
+            if (@($service.DependentServices | Where-Object { $_.Status -ne 'Stopped' }).Count) {
+                throw "Service $($Entry.Name) now has running dependents; retry after closing them."
+            }
+            $actual = Get-RegistryValueState -Path $Entry.Before.DelayedAutoState.Path -Name 'DelayedAutoStart'
+            $before = $Entry.Before.DelayedAutoState
+        }
+        'Task' {
+            $task = Get-ScheduledTask -TaskPath $Entry.Before.Path -TaskName $Entry.Name -ErrorAction Stop
+            if ([bool]$task.Settings.Enabled -ne [bool]$Entry.Before.Enabled) {
+                throw "Task $($Entry.Name) changed since planning; retry."
+            }
+            return
+        }
+        'Registry' {
+            $actual = Get-RegistryValueState -Path $Entry.Before.Path -Name $Entry.Name
+            $before = $Entry.Before
         }
     }
-
-    $registry = foreach ($target in $RegistryTargets) {
-        Get-RegistryValueState -Path $target.Path -Name $target.Name
+    if ($actual.ValueExists -ne $before.ValueExists -or
+        ($actual.ValueExists -and ($actual.Kind -ne $before.Kind -or
+        (ConvertTo-Json -InputObject $actual.Value -Compress) -ne (ConvertTo-Json -InputObject $before.Value -Compress)))) {
+        throw "Registry state for $($Entry.Name) changed since planning; retry."
     }
+}
 
-    $state = [pscustomobject]@{
-        SchemaVersion = 1
-        ScriptVersion = $ScriptVersion
-        CreatedUtc    = (Get-Date).ToUniversalTime().ToString('o')
-        ComputerName  = $env:COMPUTERNAME
-        UserName      = [Security.Principal.WindowsIdentity]::GetCurrent().Name
-        Services      = @($services)
-        Tasks         = @($tasks)
-        Registry      = @($registry)
+function Invoke-PostUpdateEntry {
+    param([Parameter(Mandatory)]$Entry)
+    switch ($Entry.Kind) {
+        'Service' {
+            Assert-PostUpdateEntry -Entry $Entry
+            $target = $AllServiceTargets | Where-Object Name -eq $Entry.Name | Select-Object -First 1
+            if ($Entry.Desired -ne $target.StartupType) { throw 'Unexpected desired service startup.' }
+            if ((Get-ServiceStartupType $Entry.Name) -ne $Entry.Desired) {
+                Set-Service -Name $Entry.Name -StartupType $Entry.Desired -ErrorAction Stop
+            }
+            if ((Get-Service -Name $Entry.Name).Status -ne 'Stopped') { Stop-Service -Name $Entry.Name -ErrorAction Stop }
+            (Get-Service -Name $Entry.Name).WaitForStatus('Stopped',[TimeSpan]::FromSeconds(15))
+            if ((Get-ServiceStartupType $Entry.Name) -ne $Entry.Desired) { throw "Service $($Entry.Name) startup did not verify." }
+        }
+        'Task' {
+            $task = Get-ScheduledTask -TaskPath $Entry.Before.Path -TaskName $Entry.Name -ErrorAction Stop
+            Disable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null
+            if ((Get-ScheduledTask -TaskPath $Entry.Before.Path -TaskName $Entry.Name).Settings.Enabled) { throw "Task $($Entry.Name) remained enabled." }
+        }
+        'Registry' {
+            $target = $RegistryTargets | Where-Object { $_.Path -eq $Entry.Before.Path -and $_.Name -eq $Entry.Name } | Select-Object -First 1
+            $target = $target.PSObject.Copy()
+            $target.Value = $Entry.Desired
+            Set-RegistryTarget -Target $target
+            $actual = Get-RegistryValueState -Path $Entry.Before.Path -Name $Entry.Name
+            if (-not $actual.ValueExists -or $actual.Kind -ne 'DWord' -or $actual.Value -ne $Entry.Desired) { throw 'Policy write did not verify.' }
+        }
     }
+}
 
-    $stateFile = Join-Path $directory 'state.xml'
-    $state | Export-Clixml -LiteralPath $stateFile -Depth 8
-
-    if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
-        throw 'State backup verification failed; no changes were made.'
+function Restore-PostUpdateEntry {
+    param([Parameter(Mandatory)]$Entry)
+    switch ($Entry.Kind) {
+        'Registry' {
+            Restore-RegistryState -Item $Entry.Before
+            $actual = Get-RegistryValueState -Path $Entry.Before.Path -Name $Entry.Name
+            if ($actual.ValueExists -ne $Entry.Before.ValueExists -or
+                ($actual.ValueExists -and ($actual.Kind -ne $Entry.Before.Kind -or
+                (ConvertTo-Json -InputObject $actual.Value -Compress) -ne (ConvertTo-Json -InputObject $Entry.Before.Value -Compress)))) {
+                throw 'Registry restoration did not verify.'
+            }
+        }
+        'Task' {
+            $task = Get-ScheduledTask -TaskPath $Entry.Before.Path -TaskName $Entry.Name -ErrorAction Stop
+            if ($Entry.Before.Enabled) { Enable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null }
+            else { Disable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null }
+            $actual = Get-ScheduledTask -TaskPath $Entry.Before.Path -TaskName $Entry.Name
+            if ([bool]$actual.Settings.Enabled -ne [bool]$Entry.Before.Enabled) { throw 'Task restoration did not verify.' }
+        }
+        'Service' {
+            $startupForRestore = if ($Entry.Before.StartupType -eq 'Disabled' -and $Entry.Before.Status -eq 'Running') { 'Manual' } else { $Entry.Before.StartupType }
+            Set-Service -Name $Entry.Name -StartupType $startupForRestore -ErrorAction Stop
+            Restore-RegistryState -Item $Entry.Before.DelayedAutoState
+            if ($Entry.Before.Status -eq 'Running' -and (Get-Service $Entry.Name).Status -ne 'Running') {
+                Start-Service $Entry.Name -ErrorAction Stop
+            }
+            if ($Entry.Before.Status -eq 'Stopped' -and (Get-Service $Entry.Name).Status -ne 'Stopped') {
+                Stop-Service $Entry.Name -ErrorAction Stop
+            }
+            (Get-Service $Entry.Name).WaitForStatus($Entry.Before.Status,[TimeSpan]::FromSeconds(15))
+            if ($startupForRestore -ne $Entry.Before.StartupType) {
+                Set-Service -Name $Entry.Name -StartupType $Entry.Before.StartupType -ErrorAction Stop
+            }
+            if ((Get-ServiceStartupType $Entry.Name) -ne $Entry.Before.StartupType) { throw 'Service restoration did not verify.' }
+        }
     }
+}
 
-    return $stateFile
+function Restore-PostUpdateState {
+    param([Parameter(Mandatory)][string]$StateFile)
+    $state = Import-Clixml -LiteralPath $StateFile
+    if ($state.SchemaVersion -ne 2 -or $state.ComputerName -ne $env:COMPUTERNAME) { throw 'Backup schema or computer mismatch.' }
+    if ($state.Restored) { Write-Host 'This backup was already restored.'; return }
+    foreach ($entry in $state.Entries) { Assert-PostUpdateEntry -Entry $entry }
+    if (@($state.Entries | Where-Object { $_.Kind -eq 'Registry' -and $_.Before.Path -like 'HKCU:*' }).Count -gt 0) {
+        if (-not $state.PSObject.Properties['UserSid'] -or $state.UserSid -ne (Get-CurrentUserSid)) {
+            throw 'This backup contains user settings; restore it using the same Windows account that applied it.'
+        }
+    }
+    $indices = @($state.Attempted)
+    [array]::Reverse($indices)
+    foreach ($i in $indices) {
+        if ([int]$i -lt 0 -or [int]$i -ge @($state.Entries).Count) { throw 'Invalid journal index.' }
+    }
+    $errors = New-Object System.Collections.Generic.List[string]
+    foreach ($i in $indices) {
+        try { Restore-PostUpdateEntry -Entry $state.Entries[[int]$i] }
+        catch { $errors.Add("$($state.Entries[[int]$i].Name): $($_.Exception.Message)") }
+    }
+    if ($errors.Count) { throw ("Restore incomplete; keep backup and retry:`n" + ($errors -join "`n")) }
+    $state.Restored = $true
+    $state.Result = 'Restored'
+    Save-PostUpdateState -State $state -File $StateFile
+    Write-Host "Restored and verified: $StateFile" -ForegroundColor Green
+    Write-Host 'Restart Windows before measuring again.'
 }
 
 function Set-RegistryTarget {
@@ -330,7 +540,7 @@ function Restore-RegistryState {
     }
 }
 
-function Restore-State {
+function Restore-LegacyState {
     param(
         [Parameter(Mandatory)][string]$StateFile,
         [switch]$Quiet
@@ -392,13 +602,26 @@ function Restore-State {
     }
 }
 
+function Restore-State {
+    param([Parameter(Mandatory)][string]$StateFile)
+    if (-not (Test-Path -LiteralPath $StateFile -PathType Leaf)) { throw "Backup not found: $StateFile" }
+    $state = Import-Clixml -LiteralPath $StateFile
+    if ($state.SchemaVersion -eq 2) { Restore-PostUpdateState -StateFile $StateFile; return }
+    if ($state.SchemaVersion -eq 1) {
+        Write-Warning 'Restoring a legacy v1 backup will replay all targets captured by that older script.'
+        Restore-LegacyState -StateFile $StateFile
+        return
+    }
+    throw "Unsupported backup schema $($state.SchemaVersion)."
+}
+
 function Show-Plan {
-    Write-Section 'Dell G15 5530 - precision aggressive debloat (preview)'
+    Write-Section 'Dell G15 5530 - aggressive telemetry debloat (preview)'
 
     $edition = (Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion').EditionID
     Write-Host "Script version : $ScriptVersion"
     Write-Host "Windows edition: $edition"
-    Write-Host "NVIDIA App     : $(if ($KeepNvidiaApp) { 'preserved by request' } else { 'background container set to Manual and stopped' })"
+    Write-Host 'NVIDIA App     : all NVIDIA services left unchanged'
 
     Write-Host ''
     Write-Host 'Services:' -ForegroundColor Cyan
@@ -419,7 +642,12 @@ function Show-Plan {
             continue
         }
         $startup = Get-ServiceStartupType -Name $target.Name
-        Write-Host ('  {0}: {1}/{2} -> Manual/Stopped' -f $target.Name, $startup, $service.Status)
+        if ($startup -eq $target.StartupType -and $service.Status -eq 'Stopped') {
+            Write-Host ('  {0}: {1}/{2} -> ALREADY CONFIGURED' -f $target.Name, $startup, $service.Status)
+        }
+        else {
+            Write-Host ('  {0}: {1}/{2} -> {3}/Stopped' -f $target.Name, $startup, $service.Status, $target.StartupType)
+        }
         Write-Host ('    {0}' -f $target.Reason) -ForegroundColor DarkGray
     }
 
@@ -446,141 +674,113 @@ function Show-Plan {
 
     Write-Host ''
     Write-Host 'Documented policies:' -ForegroundColor Cyan
-    foreach ($target in $RegistryTargets) {
+    $applicable = @(Get-ApplicableRegistryTargets)
+    foreach ($target in $applicable) {
         $old = Get-RegistryValueState -Path $target.Path -Name $target.Name
         $oldText = if ($old.ValueExists) { [string]$old.Value } else { '<not configured>' }
         Write-Host ('  {0}\{1}: {2} -> {3}' -f $target.Path, $target.Name, $oldText, $target.Value)
         Write-Host ('    {0}' -f $target.Reason) -ForegroundColor DarkGray
     }
 
+    foreach ($target in $RegistryTargets) {
+        if ($applicable.Name -notcontains $target.Name) {
+            Write-Host "  [edition not supported; unchanged] $($target.Name)"
+        }
+    }
+    $aiPath = 'HKLM:\SOFTWARE\Policies\Microsoft\Windows\WindowsAI'
+    foreach ($name in $ReportedAIValues) {
+        $old = Get-RegistryValueState -Path $aiPath -Name $name
+        $oldText = if ($old.ValueExists) { [string]$old.Value } else { '<not configured>' }
+        Write-Host "  [report only] $name = $oldText"
+    }
+
+    Write-Host ''
+    Write-Host 'Changes needed now (exact apply plan):' -ForegroundColor Cyan
+    $planned = @(Get-PostUpdatePlan)
+    Write-Host ("  {0} change(s); {1} services, {2} tasks, {3} registry values." -f $planned.Count,
+        @($planned | Where-Object Kind -eq 'Service').Count,
+        @($planned | Where-Object Kind -eq 'Task').Count,
+        @($planned | Where-Object Kind -eq 'Registry').Count)
+    foreach ($entry in $planned) { Write-Host ("  {0}: {1} -> {2}" -f $entry.Kind,$entry.Name,$entry.Desired) }
+    Write-Host '  Missing targets are skipped; protected targets are reported without bypassing permissions.'
+    Write-Host '  Successful changes are retained if another target fails. Only that failed target is rolled back.'
+    Write-Host '  RestoreLatest/RestoreFrom intentionally undo debloating; use only when you want to revert.'
+    Write-Host '  Disabling services removes their background activity; installed components remain available for rollback.'
+    Write-Host '  This is a configured-target check, not a network-level proof of zero telemetry.'
     Write-Host ''
     Write-Host 'Deliberately preserved:' -ForegroundColor Cyan
     Write-Host '  Defender, Firewall, Windows Update, Edge/Office update tasks'
     Write-Host '  Intel Innovation Platform Framework, Intel audio/HDCP, Wi-Fi services'
-    Write-Host '  NVIDIA display driver and NVDisplay.ContainerLocalSystem (Control Panel)'
+    Write-Host '  NVIDIA App services, display driver and Control Panel container'
     Write-Host '  Dell thermal/power components, Realtek/Dolby audio, Bluetooth and USB'
     Write-Host '  Hyper-V, WSL, Host Network Service and virtualization networking'
     Write-Host '  Sleep, hibernation, Task Scheduler, indexing state, drivers and Appx packages'
+
 }
 
 function Invoke-Apply {
     Assert-Administrator
     Show-Plan
 
+    $plan = @(Get-PostUpdatePlan)
     Write-Section 'Applying'
-    $stateFile = New-StateBackup
+    Write-Host "Planned changes: $($plan.Count)"
+    foreach ($entry in $plan) { Write-Host ("  {0}: {1} -> {2}" -f $entry.Kind, $entry.Name, $entry.Desired) }
+    if ($plan.Count -eq 0) {
+        if ($script:PlanIssues.Count) { throw ($script:PlanIssues -join [Environment]::NewLine) }
+        Write-Host 'Already configured; no backup needed.'
+        return
+    }
+    $id = (Get-Date -Format 'yyyyMMdd-HHmmss-fff') + '-' + [guid]::NewGuid().ToString('N').Substring(0,8)
+    $directory = Join-Path $StateRoot $id
+    New-Item -Path $directory -ItemType Directory -Force | Out-Null
+    $stateFile = Join-Path $directory 'state.xml'
+    $state = [pscustomobject]@{
+        SchemaVersion=2; ScriptVersion=$ScriptVersion; Id=$id
+        CreatedUtc=[DateTime]::UtcNow.ToString('o')
+        ComputerName=$env:COMPUTERNAME; UserSid=(Get-CurrentUserSid); Entries=$plan
+        Attempted=@(); Restored=$false; Result='Prepared'; Failures=@($script:PlanIssues)
+    }
+    Save-PostUpdateState -State $state -File $stateFile
     Write-Host "Backup: $stateFile"
-
-    $changedServices = @()
-    $changedTaskKeys = @()
-
-    try {
-        foreach ($target in $ServiceTargets) {
-            $service = Get-Service -Name $target.Name -ErrorAction SilentlyContinue
-            if ($null -eq $service) { continue }
-
-            try {
-                Set-Service -Name $target.Name -StartupType $target.StartupType -ErrorAction Stop
-                $changedServices += $target.Name
-            }
-            catch {
-                Write-Warning "Optional service $($target.Name) was skipped: $($_.Exception.Message)"
-                continue
-            }
-            if ($target.Stop -and $service.Status -ne 'Stopped') {
-                try {
-                    Stop-Service -Name $target.Name -ErrorAction Stop
-                }
-                catch {
-                    Write-Warning "$($target.Name) could not stop immediately; Manual startup will take effect after reboot. $($_.Exception.Message)"
-                }
-            }
-        }
-
-        foreach ($target in $TaskTargets) {
-            $task = Get-TaskOrNull -Path $target.Path -Name $target.Name
-            if ($null -ne $task) {
-                try {
-                    Disable-ScheduledTask -InputObject $task -ErrorAction Stop | Out-Null
-                    $changedTaskKeys += ('{0}|{1}' -f $target.Path, $target.Name)
-                }
-                catch {
-                    Write-Warning "Optional task $($target.Path)$($target.Name) was skipped: $($_.Exception.Message)"
-                }
-            }
-        }
-
-        # Discard the pre-change snapshot before read-back verification.
-        Clear-TaskCache
-
-        foreach ($target in $RegistryTargets) {
-            Set-RegistryTarget -Target $target
-        }
-
-        # End only exact optional UI/telemetry processes. Do not kill generic
-        # nvcontainer or msedgewebview2 processes because those may host drivers
-        # or applications that are deliberately preserved.
-        $processNames = @('CrossDeviceResume')
-        if (-not $KeepNvidiaApp) { $processNames += 'PresentMonService' }
-        foreach ($name in $processNames) {
-            Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
-        }
-
-        $verificationErrors = New-Object System.Collections.Generic.List[string]
-
-        foreach ($target in $ServiceTargets) {
-            if ($changedServices -notcontains $target.Name) { continue }
-            if ($null -eq (Get-Service -Name $target.Name -ErrorAction SilentlyContinue)) { continue }
-            $actual = Get-ServiceStartupType -Name $target.Name
-            if ($actual -ne $target.StartupType) {
-                $verificationErrors.Add("Service $($target.Name): expected startup $($target.StartupType), read back $actual")
-            }
-        }
-
-        foreach ($target in $TaskTargets) {
-            $taskKey = '{0}|{1}' -f $target.Path, $target.Name
-            if ($changedTaskKeys -notcontains $taskKey) { continue }
-            $task = Get-TaskOrNull -Path $target.Path -Name $target.Name
-            if (($null -ne $task) -and $task.Settings.Enabled) {
-                $verificationErrors.Add("Task $($target.Path)$($target.Name) remained enabled")
-            }
-        }
-
-        foreach ($target in $RegistryTargets) {
-            $actual = Get-RegistryValueState -Path $target.Path -Name $target.Name
-            if ((-not $actual.ValueExists) -or ([int64]$actual.Value -ne [int64]$target.Value)) {
-                $verificationErrors.Add("Policy $($target.Path)\$($target.Name) did not read back as $($target.Value)")
-            }
-        }
-
-        if ($verificationErrors.Count -gt 0) {
-            throw ($verificationErrors -join [Environment]::NewLine)
-        }
-    }
-    catch {
-        $failure = $_
-        Write-Warning 'A critical apply/verification step failed. Restoring the pre-change state.'
-        try {
-            Restore-State -StateFile $stateFile -Quiet
-        }
+    for ($i=0; $i -lt $plan.Count; $i++) {
+        # Validate BEFORE journaling: a stale plan must not restore over newer settings.
+        try { Assert-EntryUnchanged -Entry $plan[$i] }
         catch {
-            Write-Warning "Automatic rollback also reported an error: $($_.Exception.Message)"
+            $message = "$($plan[$i].Name): $($_.Exception.Message)"
+            $state.Failures += $message
+            Write-Warning $message
+            Save-PostUpdateState -State $state -File $stateFile
+            continue
         }
-        throw "Apply failed and rollback was attempted: $($failure.Exception.Message)"
+        $state.Attempted = @($state.Attempted) + $i
+        $state.Result = 'Applying'
+        # If journal persistence fails, abort BEFORE touching the target.
+        Save-PostUpdateState -State $state -File $stateFile
+        try { Invoke-PostUpdateEntry -Entry $plan[$i] }
+        catch {
+            $message = "$($plan[$i].Name): $($_.Exception.Message)"
+            try {
+                # Never undo unrelated successful debloating because one target failed.
+                Restore-PostUpdateEntry -Entry $plan[$i]
+                $state.Attempted = @($state.Attempted | Where-Object { $_ -ne $i })
+                $message += ' Only this target was restored.'
+            }
+            catch { $message += " Target rollback incomplete: $($_.Exception.Message)" }
+            $state.Failures += $message
+            Write-Warning $message
+        }
+        Save-PostUpdateState -State $state -File $stateFile
     }
-
-    Write-Host ''
-    Write-Host 'Applied and verified successfully.' -ForegroundColor Green
+    $state.Result = if ($state.Failures.Count) { 'AppliedWithFailures' } else { 'Applied' }
+    Save-PostUpdateState -State $state -File $stateFile
+    if ($state.Failures.Count) {
+        throw ("Completed with failures; successful changes retained. Backup: $stateFile`n" + ($state.Failures -join "`n"))
+    }
+    Write-Host 'Applied and verified.' -ForegroundColor Green
     Write-Host "Restore state: $stateFile"
-    Write-Host 'Reboot once before measuring idle power or process count.' -ForegroundColor Yellow
-    if ($KeepNvidiaApp) {
-        Write-Host 'NVIDIA note: the NVIDIA App and its background service were preserved by request.'
-    }
-    else {
-        Write-Host 'NVIDIA note: the driver and Control Panel service were preserved; the NVIDIA App overlay/recording/auto-update backend was not.'
-    }
+    Write-Host 'Restart once before measuring idle power.' -ForegroundColor Yellow
 }
-
 function Invoke-Diagnose {
     Assert-Administrator
     Write-Section 'G15 debloat diagnosis (one-shot; no resident polling)'
@@ -629,10 +829,12 @@ function Invoke-Diagnose {
     & powercfg.exe /waketimers
 
     Write-Host ''
+    Write-Host ''
     Write-Host 'This diagnosis does not call nvidia-smi and does not poll the GPU.' -ForegroundColor DarkGray
 }
 
 try {
+    if (-not [Environment]::Is64BitProcess) { throw 'Use 64-bit Windows PowerShell for the native registry and services.' }
     switch ($PSCmdlet.ParameterSetName) {
         'Apply' {
             Invoke-Apply
@@ -645,11 +847,17 @@ try {
             if (-not (Test-Path -LiteralPath $StateRoot)) {
                 throw "No backups exist under $StateRoot"
             }
-            $latest = Get-ChildItem -LiteralPath $StateRoot -Filter 'state.xml' -File -Recurse |
-                Sort-Object LastWriteTimeUtc -Descending |
-                Select-Object -First 1
+            $latest = $null
+            foreach ($file in @(Get-ChildItem -LiteralPath $StateRoot -Filter 'state.xml' -File -Recurse |
+                Sort-Object LastWriteTimeUtc -Descending)) {
+                $saved = Import-Clixml -LiteralPath $file.FullName
+                if ($saved.SchemaVersion -eq 2 -and -not $saved.Restored -and @($saved.Attempted).Count -gt 0) {
+                    $latest = $file
+                    break
+                }
+            }
             if ($null -eq $latest) {
-                throw "No restore state was found under $StateRoot"
+                throw "No unrestored journaled changes were found under $StateRoot; use -RestoreFrom with an exact older state.xml path if needed."
             }
             Restore-State -StateFile $latest.FullName
         }
